@@ -1,0 +1,37 @@
+# build outputs at repo root (the torture/ source dir shares its name with the
+# Unix binary, so only the Windows .exe is ignored for it)
+/kvdb
+/kvdb.exe
+/torture.exe
+*.test
+
+# permanent test/demo database (kept between runs, never committed)
+data/
+
+# databases, lock files, temp files
+*.db
+*.db.lock
+*.lock
+*.compact.tmp
+*.tmp
+*.log
+oracle.log
+
+# binaries
+*.exe
+*.out
+
+# reference material
+*.pdf
+
+# environment and secrets
+.env
+.env.*
+
+# editor, OS, tooling
+.vscode/
+.idea/
+.claude/
+graphify-out/
+.DS_Store
+Thumbs.db
