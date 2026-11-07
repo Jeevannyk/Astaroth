@@ -1,5 +1,5 @@
 // Command torture kills the database at random moments and checks what
-// survives against an independent oracle. README.md ("Torture tool")
+// survives against an independent oracle. README.md (section 3)
 // describes the modes and the output.
 //
 // Each iteration:

@@ -1,5 +1,5 @@
 // Command kvdb is the command-line wrapper around the engine. README.md
-// ("Run") documents every command, the text encoding of keys and values, and
+// (section 2) documents every command, the text encoding of keys and values, and
 // the serve protocol.
 package main
 

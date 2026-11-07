@@ -10,7 +10,7 @@ import (
 
 // The torture tool itself, run end to end in every mode for a few iterations
 // against the real kvdb binary. The full runs (500 iterations and more) are
-// done from the command line; see README.md, "Torture tool".
+// done from the command line; see README.md, section 3.
 func TestTortureToolAllModes(t *testing.T) {
 	iterations := "4"
 	if testing.Short() {

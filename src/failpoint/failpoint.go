@@ -29,7 +29,7 @@ var (
 )
 
 func init() {
-	v := os.Getenv("ASTAROTH_FAILPOINT")
+	v := os.Getenv("ASTAROTH_FAILPOINT")//reads env variables
 	if v == "" {
 		return
 	}
