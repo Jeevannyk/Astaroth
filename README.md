@@ -2,6 +2,35 @@
 
 A crash-safe key-value database written from scratch in Go. It uses an append-only log, an in-memory hash index, CRC32C checksums and `fsync` to provide durable writes and atomic batches.
 
+## Problem and Motivation
+
+A key-value database must do more than store and retrieve data. It must preserve acknowledged writes even when the process crashes unexpectedly.
+
+A crash during a write can leave an incomplete record. Without proper recovery, this can result in:
+
+- Loss of previously acknowledged operations.
+- Partially applied batches.
+- Corrupted database files.
+- An inconsistent in-memory index after restart.
+
+The challenge is to ensure that the database can recover to a valid state regardless of when the process is terminated.
+
+## Solution Overview
+
+Astaroth is a crash-safe, embedded key-value database implemented from scratch in Go using only the standard library.
+
+It uses three core components:
+
+- **Append-only log:** Stores transactions sequentially in a single database file.
+- **In-memory hash index:** Maps keys to their latest records on disk and is rebuilt during recovery.
+- **Recovery and validation:** Uses checksums, transaction sequence numbers and frame validation to identify committed transactions and safely remove incomplete trailing writes.
+
+The database follows a write-before-acknowledgement approach: a transaction is acknowledged only after its data has been written and synced successfully.
+
+Batches are stored as individual transaction frames, ensuring that a batch is recovered completely or not applied at all.
+
+Compaction reclaims disk space by rewriting the database with only live records.
+
 ## 1. Build
 
 **Requirement:** Go 1.22 or later. No external dependencies.
@@ -373,5 +402,23 @@ go test -short ./...
 - `go test -short ./...`: Short test suite.
 
 
+
+## Limitations and Future Improvements
+
+### Current Limitations
+
+- **Single-process access:** Only one process can open a database file at a time. Concurrent operations within that process are supported.
+- **In-memory index:** The index must be reconstructed from the log whenever the database is opened.
+- **Batch size:** A transaction frame is limited to 64 MiB.
+- **Platform testing:** Development and testing were performed on Windows. Unix code compiles and passes `go vet`, but has not been run in the same test environment.
+- **Power-loss testing:** Process termination was tested. Actual sudden power-loss behaviour was reasoned about but not directly tested.
+
+### Future Improvements
+
+- **Persistent indexing:** Introduce checkpointing or a persisted index to reduce startup recovery work.
+- **Multi-process concurrency:** Explore safe access to the same database from multiple processes.
+- **Performance optimisation:** Improve recovery and write throughput for larger database files and workloads.
+- **Broader platform validation:** Run the full test suite across Windows, Linux and macOS.
+- **Power-loss validation:** Test durability under controlled power interruption and storage failure scenarios.
 
 **Astaroth: Write. Sync. Recover. Verify.**
