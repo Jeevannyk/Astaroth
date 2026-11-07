@@ -1,93 +1,1042 @@
-# Architecture and robustness proof
+# Astaroth — Architecture
 
-This document defends the design. `BREAKING.md` attacks it, and `README.md` explains how to build, run and test it. Everything here refers to the code as it is in this repository; where something is not verified, it says so.
+## 1. Overview
 
-**The design in one paragraph.** Astaroth is an append-only log with an in-memory hash index, in one data file. Every `Put`, `Delete` and `Batch` becomes exactly one *frame*: a header carrying a transaction id, the records, and a trailing CRC32C over all of it that serves as the **commit marker**. A frame is written with one `WriteAt` and made durable with one `Sync` (fsync); only then is the index updated and only then does the call return, so only then can `serve` print `ACK`. Recovery replays every frame whose commit marker validates and cuts off the one frame a crash can leave incomplete. Compaction writes the live data to a temporary file, syncs and verifies it, and swaps it in with one atomic replace. A file-size limit is checked before any byte is written.
+Astaroth is an embedded key-value database written in Go. It stores data in one append-only database file and rebuilds an in-memory index when the database opens.
 
-## Part 1: Architecture diagram
+Its main goals are:
+- Store, read, update and delete key-value pairs.
+- Recover the database after an interrupted process.
+- Apply each batch completely or not at all.
+- Return success only after the write has been synced.
+- Support concurrent access, compaction and a configurable file-size limit.
 
-The architecture diagram is included below. The editable source is the Draw.io file (`-Architecture.drawio`), and the exported image is stored alongside this Markdown file.
+## 2. High-level architecture
 
 ![Astaroth architecture](./diagrams/Architecture.drawio.png)
 
-### Components and where they live
-
-| Component | Code | Role |
+| Component | Source code | Responsibility |
 |---|---|---|
-| Client API | `src/engine/engine.go`: `Open`, `Put`, `Delete`, `Batch`, `Get`, `Len`, `Close`; `src/engine/inspect.go`: `Dump`, `Check`; `src/engine/compact.go`: `Compact` | Library interface |
-| CLI and serve | `cmd/kvdb/commands.go`, `cmd/kvdb/serve.go` | Command-line interface and request handling |
-| Write path | `src/engine/engine.go`: `appendLocked` | Handles database writes |
-| Disk-full guard | `src/engine/compact.go`: `ensureRoomLocked`, `writeLimit`, `deleteReserve`, `compactedSize` | Checks available database space |
-| Log writer and commit marker | `src/storage/frame.go`: `EncodeFrame`, `FrameReader.Next` | Writes and validates frames |
-| In-memory index | `src/index/index.go`: `Apply`, `Get`, `Reserve`, `LiveBytes` | Maintains the in-memory key-value index |
-| Recovery | `src/recovery/recovery.go`: `Recover`, `scanLog`, `recoverTornStart`, `Check`; `src/recovery/compaction.go`: `CleanupCompaction` | Rebuilds the index and handles incomplete writes |
-| Compaction | `src/engine/compact.go`: `compactLocked`, `writeCompacted`, `verifyCompacted`, `maybeAutoCompactLocked`; `src/storage/replace_windows.go` and `replace_unix.go`: `ReplaceFile`, `SyncDir` | Rewrites the database with live records |
-| Locks | `src/lock`: `Acquire`, `Release`; `DB.mu` in `src/engine/engine.go` | Controls database access |
-| Fault injection for tests | `src/failpoint` | Simulates crashes at specific points |
+| Database engine | `src/engine/` | Public operations, write ordering, locking and compaction |
+| Storage | `src/storage/` | Header, frame encoding/decoding, file I/O and replacement |
+| Index | `src/index/` | Maps each key to its latest value location in the file |
+| Recovery | `src/recovery/` | Validates the log and rebuilds the index |
+| Process lock | `src/lock/` | Prevents two processes from opening the same database |
+| Failpoints | `src/failpoint/` | Creates controlled crash points for tests |
+| CLI | `cmd/kvdb/` | Commands and the line-based server interface |
+| Torture tool | `torture/` | Runs random workloads, kills and restarts the database process |
+| Tests | `tests/` and package tests | Checks storage, recovery, batches, compaction and concurrency |
 
-## Part 2: Scenario-to-mechanism proof table
+**Source of truth:** The database file is authoritative. The in-memory index is only an acceleration structure and can be rebuilt from the file.
 
-One row for every scenario of Groups A to F in the problem statement. "Where in the code" gives file and function. "Verified by" names the tests (in `tests/` unless noted; run one with `go test -run <Name> -v ./tests`) and the torture runs that exercise the scenario. The failpoint names (`append-after-sync` and so on) mark the exact line where a test makes the process die; the test runs a real child process that exits there without any cleanup, and then checks the recovered database against the operations the child had acknowledged.
+## 3. Database file format
 
-Torture runs referred to below, all on the development laptop with 3 concurrent writers and zero violations: `./torture --iterations 500 --seed 12345` (normal mode, 114,332 acknowledged operations, every one of the 500 kills with operations in flight), and `--iterations 100 --seed 999` in each of `large-values`, `large-batches`, `recovery-crash`, `compaction` and `disk-full`. A seed fixes the kill delays; see "Caveats" for what it does not fix.
+The file starts with a 32-byte header. Frames are appended after the header.
 
-| Scenario | Disk state at the moment of the kill | Mechanism that handles it | Where in the code | Verified by |
-|---|---|---|---|---|
-| **A1** kill before any byte of a put reaches the file | earlier frames only; the new frame is encoded in memory but not written | the index is updated only after `Sync` (step 8), and nothing of the frame is on disk, so the key is absent or keeps its previous value after restart | `src/engine/engine.go` `appendLocked` (failpoint `append-before-write`, between `EncodeFrame` and `WriteAt`) | `TestKillDuringWritePath/A1` (killed at each of the first 9 writes; state equals exactly the acknowledged operations); torture normal, seed 12345 |
-| **A2** kill after some bytes of the record (torn write) | a prefix of the frame: half of the 20-byte frame header, or half the frame; `payload_len` claims more bytes than the file holds, or `frame_crc` does not match | the commit marker: `FrameReader.Next` accepts a frame only if magic, length and CRC32C all check; `scanLog` stops at the first frame that does not; `Recover` truncates from there and syncs; the torn bytes are never indexed, so never returned | `src/storage/frame.go` `FrameReader.Next`; `src/recovery/recovery.go` `scanLog`, `Recover` | `TestKillDuringWritePath/A2` (failpoints `append-partial-header`, `append-partial-write`); `TestOpenAfterTruncationAtEveryByte` (log cut at every byte); `src/storage` `TestEveryTruncationIsTorn`, `TestEveryFlippedByteIsDetected`. Torture: real kills did not tear a write (see Caveats), so this is verified by the failpoint and truncation tests |
-| **A3** kill after the record is fully written, before fsync | the complete frame, commit marker included, in the OS page cache, not yet fsynced; a process kill does not lose the page cache | the frame is self-validating, so recovery replays it in full (either outcome is allowed); nothing else is touched because writes only append at `end` | `appendLocked` (failpoint `append-after-write`, between `WriteAt` and `Sync`); `scanLog` | `TestKillDuringWritePath/A3` (accepts the acknowledged state with or without the in-flight op, nothing else); `TestKillDuringRecovery` ("complete frame never fsynced") |
-| **A4** kill after fsync returns, before put returns | the complete frame, durable; index not yet updated; no ACK written | `Sync` returned, so the frame is on disk and recovery replays it: the key is present with the new value | `appendLocked` (failpoint `append-after-sync`, between `Sync` and `index.Apply`); `scanLog` | `TestKillDuringWritePath/A4` (the in-flight op must be present); torture normal seed 12345: 396 in-flight operations found applied in full, i.e. durable but not yet acknowledged when the kill came |
-| **A5** kill immediately after put returns success | the complete frame, durable | `Put` returns only after `Sync`, so an acknowledged put is replayed | `Put` -> `appendLocked`; `serve.go` `reply` | `TestKillImmediatelyAfterSuccess` (child exits right after its last ACK, without `Close`); `TestCLIServeKilledRepeatedly` (real `Process.Kill` of `kvdb serve`, every ACKed op checked in `dump`); torture normal seed 12345 |
-| **A6** kill during a delete | a tombstone frame (DEL record, 3 + key bytes) absent, torn, complete or durable; the key's old PUT record is untouched (append-only) | a delete is a frame like a put, so A1 to A5 apply: tombstone committed -> key absent; tombstone not committed -> old value intact. A delete of a missing key writes nothing | `src/engine/engine.go` `Delete`, `appendLocked`; `src/index/index.go` `Apply` (DEL case) | `TestKillDuringWritePath` (every fourth operation of the workload is a delete, killed at each write position); `TestConcurrentWritersKilledAtRandom` (a dedicated deleter); torture, all modes (15 to 30% deletes) |
-| **A7** kill during a put of a 1 MB value | a frame of 24 + 7 + key + 1,048,576 bytes spanning many disk blocks; any prefix of it | the same frame rules: the CRC covers every byte of the value, so a partial 1 MiB value can never validate | `appendLocked`; `FrameReader.Next` | torture `--mode large-values --seed 999` (values up to 1 MiB, a quarter exactly 1 MiB; 100 kills with operations in flight; 35 in-flight puts found applied in full, 231 absent, none partial); `TestCLIServeLargeBinaryValue`; `src/storage` `TestMaxSizedOpsRoundTrip`. The failpoint tests use small values; the 1 MiB case is verified by torture only |
-| **B1** kill after 3 of 10 operations of a batch are written | frame header and the first 3 records; no commit marker; the file ends before `payload_len` says the frame ends | the whole batch is one frame: incomplete -> not committed -> none of the 10 visible, and the tail is truncated | `src/engine/engine.go` `Batch`, `appendLocked` (failpoint `append-after-3-records`); `scanLog`, `Recover` | `TestKillDuringBatch/B1` (batch of 10, killed in each of 6 successive batches; recovered state must equal a whole number of batches); `TestKillDuringTenThousandOpBatch` |
-| **B2** kill after all 10 records, before the commit marker | header and all 10 records; the 4 bytes of `frame_crc` missing | the frame is 4 bytes shorter than `payload_len` requires -> not committed -> none visible | `appendLocked` (failpoint `append-before-commit-marker`); `FrameReader.Next` | `TestKillDuringBatch/B2`; `TestBatchWithoutCommitMarkerIsAbsent` (a committed batch frame cut at every byte, including the cut that keeps every record and drops only the marker) |
-| **B3** kill after the commit marker is written, before fsync | the complete frame, marker included, in the page cache | all or nothing: the marker validates only if all records are present, and then the whole frame is replayed | `appendLocked` (failpoint `append-after-write`) | `TestKillDuringBatch/B3` (state must be a whole number of batches) |
-| **B4** kill after the batch returns success | the complete frame, durable | `Batch` returns only after `Sync` | `Batch` -> `appendLocked` | `TestKillAfterBatchAcknowledged`; `TestKillDuringBatch` ("after fsync, before acknowledgement": the batch must be present); torture normal seed 12345 (22,900 acknowledged batches) |
-| **B5** a batch that puts X and deletes X | one frame with both records in order | ordering defined in README ("Batch semantics"): operations apply in list order, the last operation on a key wins, so `[put X, del X]` leaves X absent and `[del X, put X=v]` leaves X = v. Live writes and replay call the same `index.Apply`, in record order, so a crash cannot change the outcome | `src/index/index.go` `Apply`; `scanLog` | `TestBatchPutThenDeleteSameKey` (checked again after a restart); `TestBatchRepeatedKeys`; `src/recovery` `TestReplayOrderWithinAndAcrossFrames`; `src/index` `TestApplyOrderWithinFrame`; torture batches contain repeated keys and put/delete mixes |
-| **B6** a batch of 10,000 operations killed halfway | a partial frame of a 10,000-record batch | as B1: not committed, none visible, tail truncated; recovery reads it once | `appendLocked`; `scanLog`, `Recover` | `TestKillDuringTenThousandOpBatch` (killed three ways; none visible; open plus 10,000 reads took 60 to 90 ms); torture `--mode large-batches --seed 999` (1,838 batches of up to 10,000 operations; slowest recovery 61 ms) |
-| **C1** kill during open() while replaying the log | unchanged: replay only reads | `scanLog` never writes, so the next open replays the same bytes to the same state | `src/recovery/recovery.go` `scanLog` (failpoint `recover-replay-frame`) | `TestKillDuringRecovery` (killed after frame 1, 2 and 4, on 6 different starting files; the next open must give the same data and byte-identical file as an uninterrupted recovery); torture `--mode recovery-crash --seed 999` (182 kills during restart, 136 of them before recovery finished) |
-| **C2** kill during open() while truncating or repairing a torn tail | torn tail still present (before `Truncate`), or cut but not synced, or cut and synced; or a header being written into an empty file | the only repairs are idempotent: truncate to the end of the last valid frame, and write the header when no frame can exist yet. Rerunning on any intermediate state reaches the same decision | `Recover` (failpoints `recover-before-truncate`, `recover-after-truncate`, `recover-after-truncate-sync`); `recoverTornStart` (`recover-before-header`, `recover-after-header`) | `TestKillDuringRecovery`; `TestRecoveryKilledRepeatedly`; `src/recovery` `TestRecoveryIsIdempotent`, `TestRecoveryRepeatedGivesIdenticalResult`; torture recovery-crash seed 999 |
-| **C3** kill during compaction, before the new file replaces the old | the old data file complete and never modified; `<path>.compact.tmp` empty, partial, complete, or complete and verified | the old file is not touched until K6, so it is authoritative; the next open's `CleanupCompaction` deletes the temporary file | `src/engine/compact.go` `compactLocked` (failpoints `compact-start`, `compact-write-frame`, `compact-before-sync`, `compact-before-verify`, `compact-before-rename`); `src/recovery/compaction.go` `CleanupCompaction` | `TestKillDuringCompaction` (each point; afterwards the header generation is 1 and the file size is unchanged: the old file); `TestKillWhileWritingTemporaryFile` (after 1, 2 and 3 of 3 frames); torture `--mode compaction --seed 999` (1,045 compactions; 67 of the 100 kills landed while one was in flight) |
-| **C4** kill during compaction, in the middle of the rename or swap | the swap is one system call: either still the old file plus the temporary file, or the new file and no temporary file | `ReplaceFile` is a single `MoveFileExW(MOVEFILE_REPLACE_EXISTING \| MOVEFILE_WRITE_THROUGH)` (Windows) or `rename(2)` (Unix): the path always names one complete file. If a replace were not atomic and left no data file but a complete temporary file, `CleanupCompaction` renames the temporary file into place: it is renamed only after K3 and K4, so it is complete | `src/storage/replace_windows.go` and `replace_unix.go` `ReplaceFile`; `compactLocked` (`compact-before-rename`, `compact-after-rename`); `CleanupCompaction` | both sides of the call: `TestKillDuringCompaction` (`compact-before-rename` -> old file; `compact-after-rename` -> new file); the non-atomic intermediate state, built by hand: `TestReplacementInterruptedBetweenRemoveAndRename`, `TestKillDuringCompactionCleanup`. A kill inside the operating system call itself cannot be produced by a test; atomicity of the call is an assumption about NTFS and Unix filesystems |
-| **C5** kill during compaction, after the swap, before cleanup | the new file is the data file; the temporary file no longer exists (it was renamed); on Unix the directory may not be synced yet | there is nothing left to clean after the swap; any temporary file found next to a data file on open is from before a swap and is removed (if removal fails it is ignored, and the next compaction truncates it) | `compactLocked` (failpoints `compact-after-rename`, `compact-after-dir-sync`, `compact-done`); `CleanupCompaction` (`recover-before-tmp-remove`) | `TestKillDuringCompaction` (generation 2, smaller file, no temporary file left, all data intact); `TestKillDuringCompactionCleanup` (open killed while removing a temporary file); `TestCLICheck` (an abandoned temporary file is reported by `check` and removed by `open`) |
-| **C6** kill during close() | every acknowledged frame is already fsynced; `Close` writes nothing: it calls `Sync`, closes the handle and releases the lock | close is not special: a kill anywhere in `Close` leaves the same bytes as a kill just before it, which is the state every other crash test starts recovery from | `src/engine/engine.go` `Close` | **not verified by a dedicated test** (there is no failpoint inside `Close`). Indirectly: every crash test kills or exits without calling `Close`, and `TestCLIServeSession` covers a clean `Close` at end of input |
-| **D1** two writers putting different keys, killed at random | frames of both writers in the order they took L2; at most one frame (the one holding L2) incomplete | L2 (`DB.mu`) serializes the write path, so frames never interleave; each writer's ACK follows its own `Sync` | `src/engine/engine.go` `Put` and `appendLocked` under `DB.mu`; `cmd/kvdb/serve.go` `enqueue` (one goroutine per writer, so writers really run concurrently) | `TestConcurrentWritersKilledAtRandom` (two putters, a batch writer and a deleter in one child, `Process.Kill` after a random 80 to 480 ms, 15 iterations); torture normal seed 12345 (3 writers with separate key ranges; each writer's acknowledged state checked exactly) |
-| **D2** two writers putting the same key, killed at random | two frames carrying different whole values for the key, serialized | a value lives in one record of one frame, so it is never mixed; the key holds the value of whichever frame was applied last | `appendLocked` under `DB.mu`; `index.Apply` | `TestConcurrentWritersKilledAtRandom` (shared key: the value must be one a writer sent, checked with a CRC inside the value); `TestConcurrencyStress`; torture seed 12345 (8 shared keys written by all writers) |
-| **D3** one writer in a long batch, another doing single puts, killed at random | the batch's frame and the single puts' frames, one after another | the batch is one frame written under L2 (all or nothing, as B1 to B4); acknowledged single puts are separate durable frames | `Batch`, `Put`, `appendLocked` | `TestConcurrentWritersKilledAtRandom` (batch writer next to two putters); `TestConcurrentBatchesAndSinglePuts`; torture `--mode large-batches --seed 999` (batches of up to 10,000 operations next to single puts) |
-| **D4** a reader calling get during a batch on the same keys (no crash) | not applicable (no crash) | the batch's operations are applied to the index all at once, under L2 held exclusively, after `Sync`; `Get` takes L2 shared, so it sees the state before or after, never in between | `src/engine/engine.go` `Get`, `appendLocked` (`index.Apply` under `DB.mu`) | `TestReadersNeverSeePartialBatch` (readers read the first and then the last key of a 10-key batch while 150 batches run; it fails with "half applied" when the lock is deliberately released mid-batch); `TestConcurrencyStress`; `go test -race ./...` reports no data race |
-| **E1** file size cap reached during a single put | unchanged: the size check comes before any byte is written | the disk-full guard computes the frame size first and compares `end + size` with the limit; if compacting cannot make room the put returns `ErrDiskFull`; the database stays readable and later deletes still fit (the reserve) | `src/engine/compact.go` `ensureRoomLocked`, `writeLimit`, `deleteReserve`; called first in `appendLocked` | `TestPutRejectedAtLimit` (file unchanged, earlier keys intact, deletes still accepted); `TestDeletesAcceptedWhenFileIsExactlyFull`; `TestCLIServeDiskFull` (`ERR ... DISKFULL`, never `ACK`); torture `--mode disk-full --seed 999` (1,083 rejected writes, each checked to have had no effect) |
-| **E2** cap reached halfway through a batch | unchanged: the whole frame's size is checked before writing | the batch is one frame, so the check covers all of it; a batch that does not fit is rejected whole, even if its first operations alone would fit. A real disk-full error during the write is rolled back with `Truncate(end)` | `ensureRoomLocked`; `appendLocked` (rollback; failpoint `append-disk-full`) | `TestBatchRejectedAtLimit` (32-operation batch over the limit: file byte-identical, none visible, also after restart); `TestDiskFullDuringWriteIsRolledBack` (real disk-full error halfway through a batch frame: no bytes left behind, batch absent) |
-| **E3** cap reached, then the process is killed | file within the limit; only complete frames, since rejected writes left nothing | rejected writes never touch the file, so recovery is the ordinary case | `ensureRoomLocked`; `Recover` | `TestRestartAfterReachingLimit` (a child fills the database until a put is rejected and exits without `Close`; restart: all 59 acknowledged puts intact, limit still enforced); torture disk-full seed 999 (100 kills at the limit) |
-| **E4** cap reached during compaction | old data file untouched; the temporary file stopped below the limit and is removed | the temporary file is capped at `MaxBytes` too; reaching it (or a real disk-full error) aborts before K6, removes the temporary file and leaves the old file as it was | `src/engine/compact.go` `writeCompacted` (limit check per frame; failpoint `compact-disk-full`), `compactLocked` (`abort`) | `TestCompactionFailsCleanlyAtLimit` (live data larger than the limit: compaction fails with `ErrDiskFull`, old file byte-identical); `TestDiskFullWhileWritingCompactedFile` |
-| **E5** after deletes free up space, compaction runs, writes succeed again | after the deletes: the old file with dead records; after the compaction: a smaller file | deletes may use the reserve, so they fit in a full file; a write that does not fit triggers a compaction when the estimate says it would make room, then proceeds, with no manual step | `ensureRoomLocked`, `compactedSize`, `compactLocked` | `TestDeleteThenWriteAgainWithoutManualCompaction`; `TestDeleteCompactWriteAgain`; `TestOverwritesNeverPassTheLimit` (500 KiB of writes into a 64 KiB limit; compacted 9 times); torture disk-full seed 999 |
-| **F1** 500 consecutive random kills and restarts | any of the states above | all of the above | all of the above | `./torture --iterations 500 --seed 12345`: 500 of 500 passed in 2m17s; 114,332 acknowledged operations; every kill with operations in flight |
-| **F2** kill, restart, kill during recovery, restart, kill during recovery again | the states of C1 and C2, repeatedly | recovery reads only, except for the idempotent header write and truncation, and `CleanupCompaction` is idempotent too, so any number of interrupted recoveries leaves a file the next one handles the same way | `Recover`, `scanLog`, `recoverTornStart`, `CleanupCompaction` | torture `--mode recovery-crash --seed 999` (1 to 3 kills during every restart, 182 in total, 136 before recovery finished); `TestRecoveryKilledRepeatedly` (five interrupted recoveries in a row) |
-| **F3** 1,000,000 keys written, process killed, open() called | a log of 1,000,000+ keys (59 MB), possibly with a torn tail | one sequential scan through reused buffers; the index map is sized once from a 1 MiB sample; recovery time grows with file size | `scanLog`; `src/storage/frame.go` `FrameReader`; `src/index/index.go` `Reserve` | **manual test**: 100 runs of `kvdb batch` with 10,000 puts each (1,000,000 keys, 59 MB); `kvdb serve` fed 3,000 more puts, `kill -9` after 1.2 s (1,946 ACKs); `kvdb open` three times: 322, 353 and 438 ms; `kvdb check` OK; `kvdb dump`: all 1,000,000 keys and all 1,946 acknowledged puts present. Also `TestRecoveryTimeOneMillionKeys` (medians 0.23 to 0.39 s on three shapes, 0.79 s for a 1 GB file) |
-| **F4** database file truncated by 1 byte at the end by hand | the last frame missing the last byte of its `frame_crc` | the last frame is torn, so it is dropped and cut off; all earlier frames are intact | `FrameReader.Next`, `scanLog`, `Recover` | **manual test**: `kvdb put` a, b, c; `truncate -s -1`; `kvdb check` -> `OK keys=2 ... (torn tail: 32 bytes at offset 98, removed by the next open)`; `kvdb open` -> `keys=2 ... torn_tail_bytes=32`; `kvdb dump` -> a and b. Also `TestOpenAfterTruncationAtEveryByte` (every cut length, the last byte included). The record losing a byte is lost even if it had been acknowledged: the cut destroys it |
+### 3.1 Header — 32 bytes
 
-## Part 3: The three guarantees
+| Field | Size | Purpose |
+|---|---:|---|
+| Magic (`ASTAROTH`) | 8 bytes | Identifies an Astaroth database |
+| Version | 4 bytes | Identifies the file-format version |
+| Flags | 4 bytes | Reserved; currently zero |
+| Generation | 8 bytes | Identifies the file generation; increases after compaction |
+| Header CRC32C | 4 bytes | Checks the header contents |
+| Reserved | 4 bytes | Reserved; currently zero |
 
-### 1. Durability: once ACK is sent, the data survives
+The header uses little-endian encoding. The header checksum covers the first 24 bytes.
 
-`serve` writes `ACK <id>` from one place, `reply`, and only when the engine call returned nil (`cmd/kvdb/serve.go`). `Put`, `Delete` and `Batch` return nil only from the end of `appendLocked`, and in `appendLocked` the order is fixed: one `WriteAt` (pwrite on Unix, `WriteFile` at an explicit offset on Windows) writes the whole frame, then `Sync` (fsync on Unix, `FlushFileBuffers` on Windows) must return without error, and only then is the index updated and the call allowed to return. So an ACK on stdout implies that the fsync covering every byte of that frame had already returned. After a restart, recovery replays every frame whose commit marker validates, and a synced frame validates. Nothing later removes it: recovery only truncates bytes after the last valid frame; compaction copies every live record and switches files only after `Sync` and verification of the new file, with one atomic replace; and the index only ever points at synced frames. If `Sync` fails, it is never retried (the OS may have dropped the data, so a retry could falsely report success): the handle refuses every later write, so no ACK can follow a failed fsync.
+### 3.2 Frame layout
 
-### 2. Atomicity: a batch is never half visible
+| Field | Size |
+|---|---:|
+| Frame magic | 4 bytes |
+| Payload length | 4 bytes |
+| Sequence number | 8 bytes |
+| Operation count | 4 bytes |
+| Payload | Variable |
+| CRC32C | 4 bytes |
 
-A batch is one frame: one `EncodeFrame`, one `WriteAt`, one `Sync`. The commit marker is the frame's last 4 bytes, a CRC32C that `EncodeFrame` computes after everything else, over the frame header (transaction id, operation count, payload length) and every record. `FrameReader.Next` accepts a frame only if its magic is right, the file holds all `24 + payload_len` bytes, and the CRC matches; a frame missing any of its bytes (3 of 10 records, every record but not the marker) fails, so after a crash recovery applies either all of a batch's operations or none, and cuts the incomplete frame off. No fsync is needed between the records and the marker, because the marker is a checksum of the records, not a flag: its validity depends on every byte it covers, not on the order in which those bytes reached the disk. The size limit is checked against the whole frame before `WriteAt`, so a full disk cannot commit part of a batch either. While the process runs, the batch's operations are applied to the index in one step, after `Sync`, with `DB.mu` held exclusively; `Get` takes `DB.mu` shared, so a reader sees the state before the batch or after it. (A torn frame passing CRC32C by chance has a probability of about 2^-32.)
+The CRC32C covers the frame header and payload, but not the CRC field itself. A frame is the unit of append and batch atomicity.
 
-### 3. Recoverability: open() always succeeds on a file this database produced
+### 3.3 Operations
 
-A kill can leave only these shapes, and `Open` handles each one. (a) A compaction temporary file: next to a data file it is removed; without a data file it is renamed into place (`CleanupCompaction`). (b) A file shorter than its 32-byte header, from a kill during creation: if it is empty, zeros or a prefix of our header, the header is written and synced (`recoverTornStart`); no frame can exist yet, so nothing is lost. (c) A valid header followed by complete frames and at most one incomplete frame: writes are serialized by `DB.mu` and each one is synced before the next begins, so only the last frame can be in flight; `scanLog` stops at it and `Recover` calls `Truncate` to the end of the last valid frame, then `Sync`. The only writes recovery makes are that header write and that truncation, and both are idempotent: running recovery again on the state before, during or after either of them reaches the same result, so a kill during recovery is handled by the next recovery (C1, C2, F2; verified byte for byte by `TestKillDuringRecovery`). Compaction never modifies the old file and switches with a single `MoveFileExW` or `rename(2)`, so the data path always names a complete file (C3 to C5). `Open` refuses a file only for states no kill can produce: a wrong magic number or header checksum, a frame whose CRC is valid but whose contents are malformed, a gap in the transaction ids, or an invalid region larger than one maximum frame. It reports those and leaves the file untouched rather than guessing.
+A payload contains one or more operations:
 
-## Caveats
+| Operation | Encoding |
+|---|---|
+| PUT | Type byte, key length (2 bytes), value length (4 bytes), key bytes, value bytes |
+| DEL | Type byte, key length (2 bytes), key bytes |
 
-These are the limits of the argument above. `BREAKING.md` goes through them in more detail.
+Operation types are `1` for PUT and `2` for DEL. Lengths and numeric fields use little-endian encoding.
 
-- **Process kill, not power loss.** All verification kills the process; the OS and disk are assumed honest, as the problem statement allows. The ordering is designed to hold across power loss too (fsync before ACK, a checksum as the commit marker, write-through or a directory fsync for the rename), but power loss was not tested. On Unix the directory is not fsynced after the data file is first created.
-- **Torn writes come from tests, not from real kills.** On this machine the operating system completes a `write` call even when the process is being killed, so in the torture runs no kill tore a frame (every iteration reported a 0-byte torn tail). The kills did land inside operations: between `WriteAt` and `Sync`, or between `Sync` and the ACK (396 in-flight operations were found applied in full in the 500-iteration run). Torn frames are verified by the failpoint tests that write part of a frame and exit, and by the test that cuts a log at every byte.
-- **What a torture seed reproduces.** A seed fixes every kill delay and the random choices of each writer, but the key chosen for some deletes depends on Go map iteration order, and later iterations depend on which in-flight operations survived; the operation stream is therefore not identical between two runs with the same seed. Every run's acknowledged operations are recorded in its `oracle.log`.
-- **Atomic replace.** C4 relies on `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` being atomic on NTFS and on `rename(2)` being atomic on Unix filesystems. The NTFS behaviour is widely relied on but not formally documented; the "data file missing" rule in `CleanupCompaction` covers a replace that is not atomic.
-- **Unix code paths** (`flock`, the `rename(2)` replace, the directory fsync) compile and pass `go vet` but have not been run; all verification is on Windows.
-- **Batch size.** A batch must encode to at most 64 MiB, so 10,000 operations of 1 MB values do not fit in one batch; such a batch is rejected whole with `ErrBatchTooLarge` before anything is written.
-- **C6** has no dedicated test (see its row).
+### 3.4 Limits
+
+| Limit | Value |
+|---|---:|
+| Maximum key length | 1,024 bytes |
+| Maximum value length | 1 MiB |
+| Maximum operations per frame | 10,000 |
+| Maximum frame payload | 64 MiB |
+
+## 4. Write path and durability
+
+A PUT, DEL or BATCH follows this sequence:
+
+1. Validate the key, value and operation limits.
+2. Acquire the database's exclusive lock.
+3. Check that the database is writable and that the size limit allows the write.
+4. Encode the operation or complete batch as one frame.
+5. Write the frame at the current end of the database file.
+6. Call `Sync()` on the database file.
+7. Apply the operations to the in-memory index.
+8. Advance the file end and next sequence number.
+9. Return success to the caller.
+
+The server sends `ACK` only after the database operation returns successfully. Therefore, an ACK means the write passed the file synchronization step.
+
+If writing fails, the engine attempts to truncate the file back to its previous end. If that cleanup fails, the database is marked failed. If `Sync()` fails, the database is also marked failed rather than pretending the operation succeeded.
+
+## 5. Batch atomicity
+
+A batch is encoded into one frame, not a sequence of independent frames.
+
+- The complete batch is validated before it is written.
+- The batch is written with one append and one `Sync()` call.
+- Recovery validates the frame before applying its operations.
+- A valid frame is replayed as a whole; an incomplete or invalid trailing frame is not partly applied.
+- The exclusive database lock prevents readers from observing an intermediate index update.
+- Operations are applied in input order. The last operation for a key determines its final state.
+
+This provides all-or-nothing recovery for a batch.
+
+## 6. Index and read path
+
+The index is an in-memory Go map:
+
+`key → {record offset, value length}`
+
+It stores locations, not the values themselves.
+
+For `Get`, the engine:
+1. Acquires a read lock.
+2. Looks up the key in the index.
+3. Reads the value bytes from the database file at the stored location.
+4. Checks the record information and returns the value.
+
+A PUT updates the key's index entry. A DEL removes the key from the index.
+
+## 7. Recovery
+
+When a database is opened, Astaroth:
+
+1. Obtains the process lock.
+2. Handles any interrupted compaction cleanup.
+3. Opens the database file and checks its header.
+4. Scans frames from the beginning of the log.
+5. Checks frame magic, lengths, CRC32C, operation structure and sequence progression.
+6. Replays valid frames into a new in-memory index.
+7. Truncates and syncs a recognized incomplete trailing frame.
+8. Returns the recovered database and recovery statistics.
+
+A read error is reported; it is not treated as a torn write. Invalid data that cannot be explained as an interrupted final append is reported as corruption rather than being silently repaired.
+
+Recovery is designed to be restartable. If the process is interrupted during recovery, the next open scans the persistent file again and repeats the required cleanup.
+
+`check` performs validation without modifying the database. `open` performs recovery and may repair a recognized torn tail.
+
+## 8. Compaction
+
+The append-only log can contain old values and delete records. Compaction creates a smaller file containing only the current live values.
+
+The compaction sequence is:
+
+1. Acquire the exclusive database lock.
+2. Create a temporary replacement file with the next generation number.
+3. Copy only the latest live records into the new file.
+4. Sync the temporary file.
+5. Reopen and verify the temporary file using recovery and compare its logical contents.
+6. Close the old database file and replace it with the verified temporary file.
+7. Sync the containing directory where supported.
+8. Reopen the replacement and update the engine's file and index state.
+
+Before replacement, the original database remains authoritative. After the replacement, the higher-generation compacted file is authoritative. Startup cleanup handles temporary files left by an interrupted compaction.
+
+## 9. Disk-full protection
+
+The optional `MaxBytes` setting limits the database file size. A value of zero means no configured limit.
+
+- A write is checked before append.
+- A batch is checked as one complete frame; it is not partially accepted because of the limit.
+- A rejected write returns a disk-full error and must not change the logical database state.
+- Deletes remain possible using the reserved space described by the implementation.
+- Compaction can reclaim space occupied by overwritten and deleted records, but it also needs space for its temporary replacement file.
+
+The limit applies to the data file and the temporary compaction file as implemented; during compaction both files may exist at once.
+
+## 10. Concurrency and process ownership
+
+### In-process locking
+
+The engine uses `sync.RWMutex`:
+- Multiple readers can hold a read lock together.
+- A write or compaction takes the exclusive lock.
+- Readers cannot observe an index partway through a batch update.
+
+### Cross-process locking
+
+A lock file associated with the database prevents another process from opening the same database concurrently. Platform-specific implementations are in `src/lock/`.
+
+## 11. CLI and server interface
+
+The `kvdb` command provides:
+
+| Command | Purpose |
+|---|---|
+| `open` | Open or create a database and run recovery |
+| `put` | Store a value |
+| `get` | Read a value |
+| `del` | Delete a key |
+| `batch` | Apply operations from a file or standard input as one batch |
+| `dump` | Print all key-value pairs in key order |
+| `check` | Validate the file without repairing it |
+| `serve` | Accept line-based requests and return replies such as ACK, VALUE or ERR |
+
+In `serve`, a batch is staged between `begin` and `commit`. Nothing from that batch is written before commit. An `ACK` is returned only after the operation is durable.
+
+## 12. Testing strategy
+
+Astaroth uses unit tests, integration tests, failpoint-driven process crashes and the torture executable.
+
+- Storage tests check header and frame encoding, decoding and corruption handling.
+- Engine tests check key-value operations, batch behaviour and file limits.
+- Recovery tests check replay, truncation and interrupted recovery.
+- Compaction tests check replacement and crash points around the swap.
+- Concurrency tests check readers, writers and process termination.
+- The torture tool repeatedly runs concurrent workloads, kills and restarts `kvdb`, then compares the recovered database with an oracle built from acknowledged replies.
+
+The individual A1–F4 procedures, commands, file states, expected dumps and explanations are included in Section 16 below.
+
+## 13. Correctness guarantees
+
+### Durability
+
+A successful database write returns only after the frame has been written and `Sync()` has succeeded. In server mode, `ACK` is sent after that success.
+
+### Atomicity
+
+A batch is one frame. Recovery validates the complete frame before applying its operations, so a batch is recovered as a whole or not at all.
+
+### Recoverability
+
+The append-only database file is the source of truth. Recovery scans and validates the log, rebuilds the index and repairs a recognized incomplete trailing frame. Recovery can be restarted after another process interruption.
+
+## 14. Known limitations
+
+- Process-kill tests do not prove behaviour under physical power loss.
+- A successful `Sync()` is trusted; tests cannot prove that faulty hardware truly persisted the bytes.
+- CRC32C detects accidental corruption but is not cryptographic authentication.
+- Compaction takes the exclusive lock and can temporarily require space for a second copy of live data.
+- Compaction thresholds are fixed in the current implementation.
+- Performance measurements depend on the machine, storage device, operating system and file-cache state.
+- Platform-specific file replacement and locking behaviour should be tested on each target operating system.
+
+## 15. Related documentation
+
+- `README.md` — build, CLI usage, serve protocol, torture tool and project tests.
+- `DESIGN.md` — detailed design decisions and implementation reasoning.
+- `BREAKING.md` — crash points and known weaknesses.
+- `PROMPTS.md` — development prompt history.
+- `diagrams/Architecture.drawio.png` — architecture diagram.
+
+## 16. Scenario-to-mechanism proof
+
+This table connects the challenge scenarios to the mechanism that protects the database and the corresponding test evidence. A test passing is evidence for the tested process-crash scenario; it is not proof of physical power-loss behaviour.
+
+| Scenario | Failure or workload | Protection mechanism | Test evidence |
+|---|---|---|---|
+| A1–A2 | Crash before or during a frame write | Frame boundaries, length checks and CRC32C; recovery rejects an incomplete tail | `TestKillDuringWritePath` |
+| A3 | Crash after write, before `Sync()` | Recovery accepts a complete valid frame if it survived; otherwise it ignores the incomplete tail | `TestKillDuringWritePath` |
+| A4–A5 | Crash after `Sync()` or immediately after success | Sync-before-acknowledgement ordering | `TestKillDuringWritePath`, `TestKillImmediatelyAfterSuccess` |
+| A6–A7 | Interrupted delete or large-value write | Delete is logged as a frame; incomplete frame is not replayed | Write-path crash tests and key/value tests |
+| B1–B3 | Batch interrupted before/after its commit check or before sync | A batch is one frame; recovery validates it before replay | `TestKillDuringBatch` |
+| B4 | Crash after batch acknowledgement | Batch is synced before success/ACK | `TestKillAfterBatchAcknowledged` |
+| B5 | Repeated key operations in one batch | Operations are applied in input order | `TestBatch` / batch operation tests |
+| B6 | Interrupted 10,000-operation batch | One-frame batch validation and recovery | `TestKillDuringTenThousandOpBatch` |
+| C1–C2 | Recovery interrupted or torn tail cleanup interrupted | Recovery rescans the persistent log and repeats tail cleanup | `TestKillDuringRecovery`, `TestRecoveryKilledRepeatedly` |
+| C3–C5 | Crash during temporary-file creation or replacement | Original file remains authoritative until replacement; generation and startup cleanup identify the active file | `TestKillDuringCompaction`, `TestKillWhileWritingTemporaryFile`, `TestReplacementInterruptedBetweenRemoveAndRename` |
+| C6 | Close/reopen after an acknowledged write | Persisted log is replayed when reopened | `TestKillImmediatelyAfterSuccess` (not a dedicated crash-inside-`Close` test) |
+| D1 | Concurrent writers and process termination | Exclusive writer lock, serialized append and recovery validation | `TestConcurrentWritersKilledAtRandom` |
+| D2 | Concurrent writers updating a shared key | Serialized writes prevent torn or mixed records | `TestConcurrentWritersKilledAtRandom` |
+| D3 | Concurrent batches, PUTs and DELs | Database lock and whole-frame batch application | `TestConcurrentWritersKilledAtRandom`, `TestReadersNeverSeePartialBatch` |
+| E1 | File-size limit reached during PUT | Capacity checked before append; rejected write leaves file/state unchanged | `TestPutRejectedAtLimit` |
+| E2 | File-size limit reached during batch | Entire batch capacity checked before append | `TestBatchRejectedAtLimit` |
+| E3 | Reopen after reaching the limit | Recovery reads existing valid records independently of remaining write capacity | `TestRestartAfterReachingLimit` |
+| E4 | Disk full during compaction | Original database is retained if temporary replacement cannot be completed | `TestCompactionFailsCleanlyAtLimit`, `TestDiskFullWhileWritingCompactedFile` |
+| E5 | Delete, then write again | Delete reserve and compaction reclaim space for later writes | `TestDeleteThenWriteAgainWithoutManualCompaction` |
+| F1–F2 | Repeated random workloads and recovery crashes | Repeated recovery and state checking against acknowledged operations | Torture tool tests and `TestRecoveryKilledRepeatedly` |
+| F3 | One-million-key recovery performance | Sequential frame scan and index reconstruction | `TestRecoveryTimeOneMillionKeys` |
+| F4 | Database truncated by one byte | Incomplete final frame is detected and removed during recovery | `TestEveryTruncationIsTorn`, truncation tests |
+
+**Group D note:** The supplied implementation and test source define three concurrency sub-scenarios (D1–D3), all exercised by `TestConcurrentWritersKilledAtRandom`. There is no separate D4 requirement in the supplied project specification, so none is invented here.
+
+## 17. Crash-test cases (A1–F4)
+
+Run the commands in **PowerShell from the project root**. Follow each case in order: create the database, run the actual command, inspect the file, then dump/reopen it where a dump is available. Failpoint-triggered exits (commonly exit code 86) are expected. Reset `ASTAROTH_FAILPOINT` to `$null` after each failpoint command.
+
+
+### Prepare shared input files
+
+Run once from the project root before cases that use these files:
+
+```powershell
+New-Item -ItemType Directory -Force demo | Out-Null
+1..10 | ForEach-Object { "put b$_ value$_" } | Set-Content demo\ten.txt -Encoding ascii
+1..10000 | ForEach-Object { "put t$_ value$_" } | Set-Content demo\tenk.txt -Encoding ascii
+$largeValue = "Z" * 1048576
+"put big $largeValue" | Set-Content demo\big.txt -Encoding ascii
+```
+
+`ten.txt` and `tenk.txt` are batch input files. `big.txt` contains one PUT with a 1 MiB value. The CLI batch format is `put <key> <value>` or `del <key>`.
+
+# Group A: Single write
+
+## A1. Kill before any byte is written
+
+**1. DB creation**
+```powershell
+Remove-Item demo\a1.db* -EA 0; .\kvdb put demo\a1.db base 1
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="append-before-write"; .\kvdb put demo\a1.db k v; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. File accessed — `demo\a1.db`**
+- Contains the committed record `base = 1`.
+- The new `k = v` write is interrupted before any byte is written.
+
+**4. Dump**
+```powershell
+.\kvdb dump demo\a1.db
+```
+**Expected:** `base 1` only.
+
+**5. Why?** The new record never entered the log. Recovery finds only the previously committed record.
+
+## A2. Torn write (partial record)
+
+**1. DB creation**
+```powershell
+Remove-Item demo\a2.db* -EA 0; .\kvdb put demo\a2.db base 1
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="append-partial-write"; .\kvdb put demo\a2.db k v; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. File accessed — `demo\a2.db`**
+- Contains `base = 1`.
+- A partial `k = v` record is appended before termination.
+
+**4. Dump**
+```powershell
+.\kvdb dump demo\a2.db
+```
+**Expected:** `base 1` only.
+
+**5. Why?** Recovery detects the incomplete final record and does not apply it.
+
+For a partial frame-header test, use the failpoint `append-partial-header`.
+
+## A3. Written, before fsync
+
+**1. DB creation**
+```powershell
+Remove-Item demo\a3.db* -EA 0; .\kvdb put demo\a3.db base 1
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="append-after-write"; .\kvdb put demo\a3.db k v; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. File accessed — `demo\a3.db`**
+- The new record is written.
+- The process stops before `fsync`/`Sync()`.
+
+**4. Dump**
+```powershell
+.\kvdb dump demo\a3.db
+```
+**Expected:** `base 1` and `k v`, or `base 1` only.
+
+**5. Why?** Before sync, the new bytes may or may not survive. Durability is not yet guaranteed.
+
+## A4. After fsync, before returning
+
+**1. DB creation**
+```powershell
+Remove-Item demo\a4.db* -EA 0; .\kvdb put demo\a4.db base 1
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="append-after-sync"; .\kvdb put demo\a4.db k v; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. File accessed — `demo\a4.db`**
+- The new record is written and synced.
+- The process stops before returning success.
+
+**4. Dump**
+```powershell
+.\kvdb dump demo\a4.db
+```
+**Expected:** `base 1` and `k v`.
+
+**5. Why?** Sync completed before the crash, so the write must survive recovery.
+
+## A5. Kill right after success
+
+**1. DB creation**  
+The Go test creates its own database.
+
+**2. Actual command**
+```powershell
+go test ./tests -run '^TestKillImmediatelyAfterSuccess$' -v
+```
+
+**3. File accessed**  
+The test's internally created database. Its temporary path is selected by the test.
+
+**4. Dump**  
+No separate dump command is provided by this test.
+
+**5. Why?** It checks that a write acknowledged as successful survives immediate process termination and recovery.
+
+## A6. Kill during a delete
+
+**1. DB creation**
+```powershell
+Remove-Item demo\a6.db* -EA 0; .\kvdb put demo\a6.db base 1
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="append-partial-write"; .\kvdb del demo\a6.db base; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. File accessed — `demo\a6.db`**
+- Contains `base = 1`.
+- The delete record is only partially written.
+
+**4. Dump**
+```powershell
+.\kvdb dump demo\a6.db
+```
+**Expected:** `base 1` remains.
+
+**5. Why?** The incomplete delete is rejected, so the previous value remains.
+
+To demonstrate a completed delete instead:
+```powershell
+$env:ASTAROTH_FAILPOINT="append-after-sync"; .\kvdb del demo\a6.db base; $env:ASTAROTH_FAILPOINT=$null
+.\kvdb dump demo\a6.db
+```
+Expected: `base` is absent.
+
+## A7. Kill during a 1 MB put
+
+**1. DB creation**
+```powershell
+Remove-Item demo\a7.db* -EA 0; .\kvdb put demo\a7.db big old
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="append-partial-write"; .\kvdb batch demo\a7.db demo\big.txt; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. Files accessed**
+- `demo\a7.db` — database containing `big = old`.
+- `demo\big.txt` — input containing the 1 MB replacement value.
+
+**4. Dump**
+```powershell
+.\kvdb dump demo\a7.db
+```
+**Expected:** `big old`.
+
+**5. Why?** The replacement record is incomplete, so recovery keeps the previous value.
+
+# Group B: Batch
+
+## B1. Kill after 3 of 10 operations
+
+**1. DB creation**
+```powershell
+Remove-Item demo\b1.db* -EA 0; .\kvdb put demo\b1.db base 1
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="append-after-3-records"; .\kvdb batch demo\b1.db demo\ten.txt; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. Files accessed**
+- `demo\b1.db` — database.
+- `demo\ten.txt` — ten-operation input.
+
+Only three operations are written before termination.
+
+**4. Dump**
+```powershell
+.\kvdb dump demo\b1.db
+```
+**Expected:** `base 1` only.
+
+**5. Why?** The batch is incomplete and is not applied during recovery.
+
+## B2. All 10 written, no commit marker
+
+**1. DB creation**
+```powershell
+Remove-Item demo\b2.db* -EA 0; .\kvdb put demo\b2.db base 1
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="append-before-commit-marker"; .\kvdb batch demo\b2.db demo\ten.txt; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. Files accessed**
+- `demo\b2.db` — database.
+- `demo\ten.txt` — ten-operation input.
+
+All ten operations are written, but the commit marker is not.
+
+**4. Dump**
+```powershell
+.\kvdb dump demo\b2.db
+```
+**Expected:** `base 1` only.
+
+**5. Why?** Recovery rejects the batch because its complete commit check is missing.
+
+## B3. Marker written, before fsync
+
+**1. DB creation**
+```powershell
+Remove-Item demo\b3.db* -EA 0; .\kvdb put demo\b3.db base 1
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="append-after-write"; .\kvdb batch demo\b3.db demo\ten.txt; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. Files accessed**
+- `demo\b3.db` — database.
+- `demo\ten.txt` — ten-operation input.
+
+The frame and its CRC are written, but sync has not completed.
+
+**4. Dump**
+```powershell
+.\kvdb dump demo\b3.db
+```
+**Expected:** Either all ten batch operations or none; never a partial batch.
+
+**5. Why?** The frame may or may not persist before sync, but recovery must preserve batch atomicity.
+
+## B4. Kill after batch acknowledgement
+
+**1. DB creation and server startup** — PowerShell window 1
+```powershell
+Remove-Item demo\b4.db* -EA 0; .\kvdb serve demo\b4.db
+```
+
+**2. Actual command** — enter in the server window
+```text
+b1 begin
+b1 put b1 1
+b1 put b2 2
+b1 put b3 3
+b1 commit
+```
+Wait for `ACK b1`. Then, in PowerShell window 2:
+```powershell
+Stop-Process -Name kvdb -Force
+```
+
+**3. File accessed — `demo\b4.db`**  
+The server writes the three operations as a batch to this database.
+
+**4. Dump**
+```powershell
+.\kvdb dump demo\b4.db
+```
+**Expected:**
+```text
+b1 1
+b2 2
+b3 3
+```
+
+**5. Why?** The server acknowledged the batch only after its write completed successfully. All three values must remain.
+
+## B5. Put X and delete X in one batch
+
+**1. DB creation and input file**
+```powershell
+Remove-Item demo\b5.db* -EA 0; "put x 1","del x","put y 2" | Set-Content demo\b5.txt -Encoding ascii
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="append-after-sync"; .\kvdb batch demo\b5.db demo\b5.txt; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. Files accessed**
+- `demo\b5.db` — database.
+- `demo\b5.txt` — three-operation batch: put x, delete x, put y.
+
+**4. Dump**
+```powershell
+.\kvdb dump demo\b5.db
+```
+**Expected:** `y 2` only.
+
+**5. Why?** The delete follows the put for `x`, so `x` is absent in the final state. `y` remains.
+
+## B6. 10,000-operation batch killed during append
+
+**1. DB creation**
+```powershell
+Remove-Item demo\b6.db* -EA 0; .\kvdb put demo\b6.db base 1
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="append-partial-write"; .\kvdb batch demo\b6.db demo\tenk.txt; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. Files accessed**
+- `demo\b6.db` — database.
+- `demo\tenk.txt` — input containing 10,000 PUT operations.
+
+**4. Recovery and dump**
+```powershell
+.\kvdb open demo\b6.db; .\kvdb dump demo\b6.db
+```
+**Expected:** `base 1` only; recovery time should be below the stated test target.
+
+**5. Why?** The interrupted batch is rejected as a whole, preserving the baseline record.
+
+**Automated test:** `go test ./tests -run '^TestKillDuringTenThousandOpBatch$' -v`
+
+# Group C: Recovery and compaction
+
+## C1. Kill while replaying the log
+
+**1. DB creation**
+```powershell
+Remove-Item demo\c1.db* -EA 0; 1..5 | % { .\kvdb put demo\c1.db "k$_" "v$_" }
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="recover-replay-frame:3"; .\kvdb open demo\c1.db; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. File accessed — `demo\c1.db`**  
+Contains five valid records. Recovery is interrupted while replaying frame 3.
+
+**4. Recovery and dump**
+```powershell
+.\kvdb open demo\c1.db; .\kvdb dump demo\c1.db
+```
+**Expected:** `k1` through `k5` are present.
+
+**5. Why?** The log remains intact. A later open can replay it again and rebuild the index.
+
+## C2. Kill while truncating a torn tail
+
+**1. DB creation and tail damage**
+```powershell
+Remove-Item demo\c2.db* -EA 0; .\kvdb put demo\c2.db base 1; Add-Content demo\c2.db -Value "JUNKJUNKJUNK" -NoNewline
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="recover-before-truncate"; .\kvdb open demo\c2.db; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. File accessed — `demo\c2.db`**
+- Contains valid `base = 1`.
+- Has 12 extra junk bytes at the end.
+- Recovery stops before truncating the invalid tail.
+
+**4. Recovery and dump**
+```powershell
+.\kvdb open demo\c2.db; .\kvdb dump demo\c2.db
+```
+**Expected:** Recovery reports a 12-byte torn tail; `base 1` remains.
+
+**5. Why?** The second recovery attempt detects the same invalid tail, retries cleanup and preserves the valid record.
+
+## C3. Kill during compaction, before verification
+
+**1. DB creation**
+```powershell
+Remove-Item demo\c3.db* -EA 0; 1..30 | % { .\kvdb put demo\c3.db key "v$_" }
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="compact-before-verify"; "compact" | .\kvdb serve demo\c3.db; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. Files accessed**
+- `demo\c3.db` — original database, generation 1.
+- Compaction temporary file — unfinished replacement.
+
+**4. Recovery, check and dump**
+```powershell
+.\kvdb open demo\c3.db; .\kvdb check demo\c3.db; .\kvdb dump demo\c3.db
+```
+**Expected:** Generation 1 remains active; `key` has value `v30`.
+
+**5. Why?** The temporary replacement was not verified or installed. The original file remains authoritative.
+
+## C4. Kill immediately before rename
+
+**1. DB creation**
+```powershell
+Remove-Item demo\c4.db* -EA 0; 1..30 | % { .\kvdb put demo\c4.db key "v$_" }
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="compact-before-rename"; "compact" | .\kvdb serve demo\c4.db; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. Files accessed**
+- `demo\c4.db` — original generation 1.
+- Compaction temporary file — prepared replacement.
+
+**4. Recovery, check and dump**
+```powershell
+.\kvdb open demo\c4.db; .\kvdb check demo\c4.db; .\kvdb dump demo\c4.db
+```
+**Expected:** Generation 1 remains active; `key` has value `v30`.
+
+**5. Why?** Rename did not happen, so the original database is still active.
+
+## C5. Kill immediately after rename
+
+**1. DB creation**
+```powershell
+Remove-Item demo\c5.db* -EA 0; 1..30 | % { .\kvdb put demo\c5.db key "v$_" }
+```
+
+**2. Actual command**
+```powershell
+$env:ASTAROTH_FAILPOINT="compact-after-rename"; "compact" | .\kvdb serve demo\c5.db; $env:ASTAROTH_FAILPOINT=$null
+```
+
+**3. Files accessed**
+- `demo\c5.db` — database path, expected to contain generation 2 after replacement.
+- Compaction temporary file — source of the replacement.
+
+**4. Recovery, check, dump and list**
+```powershell
+.\kvdb open demo\c5.db; .\kvdb check demo\c5.db; .\kvdb dump demo\c5.db; Get-ChildItem demo\c5.db*
+```
+**Expected:** Generation 2, `key = v30`, and no leftover `.compact.tmp` file.
+
+**5. Why?** Rename has already happened. Recovery must use generation 2 and finish the expected cleanup.
+
+## C6. Acknowledged write survives close and reopen
+
+**1. DB creation**  
+Handled internally by the Go test; no separate setup command is supplied.
+
+**2. Actual command**
+```powershell
+go test ./tests -run '^TestKillImmediatelyAfterSuccess$' -v
+```
+
+**3. File accessed**  
+The test's internally created database. Its exact path is determined by the test.
+
+**4. Dump**  
+No separate dump command is supplied.
+
+**5. Why?** This is a close/reopen persistence check for an acknowledged write. It is not a crash injected inside `Close()`, so it should not be presented as a dedicated close-crash test.
+
+# Group D: Concurrency
+
+## D1. Concurrent writers killed at random
+
+**1. DB creation**  
+The Go test creates its own database.
+
+**2. Actual command**
+```powershell
+go test ./tests -run '^TestConcurrentWritersKilledAtRandom$' -v
+```
+
+**3. File accessed**  
+The test-managed database used by concurrent writers. Its exact temporary path is determined by the test.
+
+**4. Dump**  
+No separate dump command is supplied.
+
+**5. Why?** The test checks that concurrent writes and random process termination do not leave an unrecoverable database.
+
+## D2. Readers never see a partial batch
+
+**1. DB creation**  
+The Go test creates its own database.
+
+**2. Actual command**
+```powershell
+go test ./tests -run '^TestReadersNeverSeePartialBatch$' -v
+```
+
+**3. File accessed**  
+The test-managed database used by concurrent readers and batch writers.
+
+**4. Dump**  
+No separate dump command is supplied.
+
+**5. Why?** A reader must see the state before or after a batch, never an intermediate state containing only part of it.
+
+## D3. Concurrent batches, PUTs and DELs
+
+**1. DB creation**  
+The Go test creates a temporary database and starts multiple writer goroutines.
+
+**2. Actual command**
+```powershell
+go test ./tests -run '^TestConcurrentWritersKilledAtRandom$' -v
+```
+
+**3. File accessed**  
+The test-managed database. The workload combines single PUTs, batches, concurrent deletes and updates to a shared key. The parent process kills the child at a random time.
+
+**4. Dump**  
+The test reopens the database and checks the recovered state against the operations acknowledged by each writer. It does not provide a separate CLI dump command.
+
+**5. Why?** Acknowledged operations must remain present, and a batch must appear as one complete state rather than a mixture of two batches.
+
+**Additional torture smoke test**
+```powershell
+.\torture.exe --iterations 30 --seed 5 --dir demo\tout --keep
+.\kvdb dump demo\tout\torture.db
+```
+This is an additional randomized workload, not the D3 concurrency proof test.
+
+# Group E: Disk full
+
+## E1. Capacity limit reached during PUTs
+
+**1. DB creation**  
+The Go test creates a fresh temporary database and opens it with a 64 KiB limit.
+
+**2. Actual command**
+```powershell
+go test ./tests -run '^TestPutRejectedAtLimit$' -v
+```
+
+**3. File accessed**  
+The test-managed database file. It repeatedly writes 1 KiB values until the next PUT is rejected.
+
+**4. Dump**  
+The test checks the database directly; it does not provide a separate CLI dump command.
+
+**Expected:** All acknowledged keys remain readable, the rejected key is absent, and the file never exceeds 64 KiB.
+
+**5. Why?** The size check rejects a write before it changes the file or logical database state.
+
+## E2. Capacity limit reached during a batch
+
+**1. DB creation and input file**
+```powershell
+Remove-Item demo\e2.db* -EA 0; 1..32 | % { "put e$_ " + ("x"*40) } | Set-Content demo\e2.txt -Encoding ascii
+```
+
+**2. Actual command**
+```powershell
+.\kvdb put demo\e2.db base 1 --max-bytes 600; .\kvdb batch demo\e2.db demo\e2.txt --max-bytes 600
+```
+
+**3. Files accessed**
+- `demo\e2.db` — database with a 600-byte limit.
+- `demo\e2.txt` — input containing 32 PUT operations.
+
+**4. Dump**
+```powershell
+.\kvdb dump demo\e2.db
+```
+**Expected:** `base 1` only.
+
+**5. Why?** The batch is checked as a whole. If it exceeds the limit, none of its operations should be committed.
+
+**Automated test:** `go test ./tests -run '^TestBatchRejectedAtLimit$' -v`
+
+## E3. Reopen after reaching the capacity limit
+
+**1. DB creation**  
+The Go test creates a temporary database, fills it to the configured limit and closes it.
+
+**2. Actual command**
+```powershell
+go test ./tests -run '^TestRestartAfterReachingLimit$' -v
+```
+
+**3. File accessed**  
+The test-managed database file, reopened with the same configured capacity limit.
+
+**4. Dump**  
+The Go test checks that the previously acknowledged values remain readable. It does not provide a separate CLI dump command.
+
+**5. Why?** A full database must still be able to reopen and recover its existing records.
+
+## E4. Capacity limit reached during compaction
+
+**1. DB creation**  
+The Go tests create their own database and temporary compaction files.
+
+**2. Actual command**
+```powershell
+go test ./tests -run '^(TestCompactionFailsCleanlyAtLimit|TestDiskFullWhileWritingCompactedFile)$' -v
+```
+
+**3. Files accessed**  
+Test-managed database and compacted replacement files. Exact paths are chosen by the tests.
+
+**4. Dump**  
+No separate dump command is supplied.
+
+**5. Why?** The tests check that running out of space during compaction does not destroy the original valid database.
+
+**Automated tests:** `go test ./tests -run '^(TestCompactionFailsCleanlyAtLimit|TestDiskFullWhileWritingCompactedFile)$' -v`
+
+## E5. Delete, then write again
+
+**1. DB creation**  
+The Go test creates a fresh temporary database, fills it to the configured 64 KiB limit, and records the acknowledged keys.
+
+**2. Actual command**
+```powershell
+go test ./tests -run '^TestDeleteThenWriteAgainWithoutManualCompaction$' -v
+```
+
+**3. File accessed**  
+The test-managed database. It deletes half of the existing keys, then writes new keys without requesting manual compaction.
+
+**4. Dump**  
+The test checks the database before and after reopening; no separate CLI dump command is provided.
+
+**Expected:** Deleted keys stay absent, surviving keys retain their values, and new writes succeed. The test also checks that compaction advanced the file generation.
+
+**5. Why?** Deletes free logical space. When needed, the implementation compacts obsolete records so later writes can fit without manual intervention.
+
+# Group F: Repeated abuse
+
+## F1. 500 iterations
+
+**1. DB creation**  
+The torture executable manages its own database.
+
+**2. Actual command**
+```powershell
+.\torture.exe --iterations 500 --seed 12345
+```
+
+**3. File accessed**  
+The database and workload files managed internally by the torture executable. No explicit output directory is supplied.
+
+**4. Dump**  
+No separate dump command is supplied.
+
+**5. Why?** Repeated randomized workloads test whether database invariants continue to hold over many iterations.
+
+**Expected output:**
+```text
+PASS: 500 of 500
+```
+
+## F2. Recovery crash mode
+
+**1. DB creation**  
+The torture executable manages its own recovery test files.
+
+**2. Actual command**
+```powershell
+.\torture.exe --iterations 100 --seed 42 --mode recovery-crash
+```
+
+**3. File accessed**  
+Internally managed recovery-crash database and test files. Exact paths depend on the executable.
+
+**4. Dump**  
+No separate dump command is supplied.
+
+**5. Why?** Repeatedly interrupted recovery should remain restartable and must not permanently corrupt the database.
+
+## F3. Recovery time for one million keys
+
+**1. DB creation**  
+The Go test prepares its own large database.
+
+**2. Actual command**
+```powershell
+go test ./tests -run '^TestRecoveryTimeOneMillionKeys$' -v
+```
+
+**3. File accessed**  
+The test-managed database containing one million keys. Its temporary path is determined by the test.
+
+**4. Dump**  
+No separate dump command is supplied.
+
+**5. Why?** The test measures the time needed to rebuild the in-memory index from a large log.
+
+**Expected:** The test reports its recovery timings; the stated target is a median below two seconds.
+
+## F4. File truncated by one byte
+
+**1. DB creation**
+```powershell
+Remove-Item demo\f4.db* -EA 0; 1..3 | % { .\kvdb put demo\f4.db "k$_" "v$_" }
+```
+
+**2. Actual command**
+```powershell
+$f=[IO.File]::Open("$PWD\demo\f4.db","Open","ReadWrite"); $f.SetLength($f.Length-1); $f.Close()
+```
+
+**3. File accessed — `demo\f4.db`**
+- Opens the database for reading and writing.
+- Removes exactly one byte from the end of the file.
+- This makes the final frame incomplete.
+
+**4. Recovery and dump**
+```powershell
+.\kvdb open demo\f4.db; .\kvdb dump demo\f4.db
+```
+**Expected:**
+```text
+k1 v1
+k2 v2
+```
+`k3` should be absent.
+
+**5. Why?** The last frame is incomplete after truncation. Recovery rejects that frame and preserves the preceding valid records.
+
