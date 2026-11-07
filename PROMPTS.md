@@ -20,6 +20,10 @@ Every prompt sent to an AI tool during the hackathon, in chronological order, un
 | 10 | ~16:50 | Phase 8: CLI commands and the serve protocol |
 | 11 | ~17:05 | Phase 9: the torture tool |
 | 12 | ~17:20 | Continue |
+| 13 | ~19:00 | Audit against the problem statement |
+| 14 | ~22:15 | ARCHITECTURE.md |
+| 15 | ~05:59 (7 Nov) | BREAKING.md |
+| 16 | ~06:28 (7 Nov) | README.md |
 
 ---
 
@@ -412,4 +416,52 @@ Purpose: resume the work after an interruption.
 
 ```text
 continue
+```
+
+
+---
+
+## Prompt 13 — Audit against the problem statement (~19:00)
+
+Purpose: compare the project with every requirement and all 32 scenarios; list what is missing; no code.
+
+```text
+So check if the project satisfies the main document ...go through the main document properly and list out all core requirements and the torture 32 major test cases a1 to f4 all of them...go through all other requirements too ...compare with whats done...give a list of everything that needs to be implemented...dont write any code yet..
+```
+
+---
+
+## Prompt 14 — ARCHITECTURE.md (~22:15)
+
+Purpose: write the architecture diagram, the 32-row proof table and the three guarantee arguments.
+
+```text
+go through the project..and create a detailed architecture.md by following how it is expected in the main PS pdf..
+```
+
+---
+
+## Prompt 15 — BREAKING.md (~05:59, 7 Nov)
+
+Purpose: write the self-attack document: crash points, ordering argument, weaknesses, failures, next steps.
+
+```text
+go through the project..and create a  breaking.md by following how it is expected in the main PS pdf..
+```
+
+---
+
+## Prompt 16 — README.md (~06:28, 7 Nov)
+
+Purpose: rewrite the README to the spec's guidelines: build, run each command, on-disk format on one page with a diagram, recovery in plain English.
+
+```text
+go through the project..and create the readme.md by following how it is expected in the main PS pdf..README.md  with: how to build, how to run each command, the on-disk format in one
+page with a diagram, and your recovery algorithm in plain EnglisThe judge will run your code on your laptop, from your repository, using your
+README. If the README is wrong, the judge stops.
+
+
+
+
+go through main pdf properly...readme is th most crucial part..dont overcomplicate it andgenerate wrt to the guidelines
 ```
