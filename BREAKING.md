@@ -1,52 +1,126 @@
-# How I would break this
+# How We Try to Break Astaroth
 
-Line numbers are those of this commit. `ARCHITECTURE.md` defends the design; this page attacks it.
+This document explains how we test Astaroth against unexpected crashes, how recovery works, and what limitations remain.
 
-## 1. Crash points
+Our goal is simple: **Previously acknowledged data must survive a process crash, and incomplete operations must never be treated as valid data.**
 
-| # | Process dies at | On disk | Next `open()` |
-|---|---|---|---|
-| 1 | `src/engine/engine.go:338` `appendLocked`: frame encoded (`:333`), `WriteAt` (`:364`) not called | earlier frames only | replays them; the operation is absent (never acknowledged) |
-| 2 | `engine.go:364`, inside `WriteAt` | a prefix of the frame: part of its 20-byte header, or every record but not the 4-byte commit marker | `scanLog` (`src/recovery/recovery.go:165`) rejects the frame (length past end of file, or CRC mismatch); `Recover` truncates to the end of the last valid frame (`:87`) and syncs (`:91`) |
-| 3 | `engine.go:370`, `Truncate` rolling back a failed `WriteAt` (disk full) | the partial frame may remain | as row 2 |
-| 4 | `engine.go:378`-`379`, after `WriteAt`, before or inside `Sync` | whole frame, marker included, in the page cache (a process kill does not lose it) | CRC valid, frame replayed: present though never acknowledged (allowed) |
-| 5 | `engine.go:387`, after `Sync`, before `index.Apply` (`:388`) | frame durable; no reply yet | replayed: present (A4) |
-| 6 | `cmd/kvdb/serve.go:207`, call returned nil, `ACK` (`:209`) not yet written | frame durable | present; the client saw no ACK (allowed) |
-| 7 | `recovery.go:229` -> `src/storage/file.go:26`-`29`, header of a new file | empty, or under 32 bytes that prefix our header | `recoverTornStart` (`recovery.go:216`) writes the header again; no frame can exist yet |
-| 8 | `recovery.go:186`, `scanLog` replaying | unchanged: replay only reads | same state again |
-| 9 | `recovery.go:87`-`91`, between `Truncate` and `Sync` | tail cut, or still there | scans again: cuts it again or finds nothing. Same result |
-| 10 | `src/engine/compact.go:159`, `writeCompacted` | old file untouched; `<path>.compact.tmp` partial | `CleanupCompaction` deletes the temporary file (`src/recovery/compaction.go:41`); old file recovered |
-| 11 | `compact.go:183`-`185`: temporary file synced (`:164`), verified (`:173`), old handle closed, `ReplaceFile` (`:186`) not called | old file complete, complete temporary file beside it | as row 10; only the compaction is lost |
-| 12 | `compact.go:186`, inside `ReplaceFile` (`MoveFileExW` / `rename(2)`) | one atomic call: row 11's state, or the new file without a temporary file | as row 11 or row 13. If a replace ever left no data file, `compaction.go:45` renames the complete temporary file into place |
-| 13 | `compact.go:190`-`197`, after the replace, before directory sync or reopen | the compacted file (generation + 1) is the data file | ordinary recovery of it |
-| 14 | `compaction.go:40`-`45`, `open` killed removing or renaming the temporary file | as row 11, or no data file and a complete temporary file | repeats the same removal or rename |
-| 15 | `engine.go:407`-`414`, inside `Close` | nothing: `Close` writes nothing, every acknowledged frame is already synced | as a kill just before `Close`; the OS released the lock |
+## 1. Crash Scenarios
 
-## 2. The ordering argument
+| No. | Crash Point | Expected Recovery |
+|---|---|---|
+| 1 | Before writing a frame | Previous data remains unchanged. |
+| 2 | During frame writing | Incomplete frame is detected and removed. |
+| 3 | During failed-write rollback | Any remaining partial data is removed. |
+| 4 | After writing but before Sync completes | A valid frame may be recovered, even without ACK. |
+| 5 | After Sync but before index update | Recovery restores the saved operation. |
+| 6 | Before sending ACK | Data remains saved, although the client receives no confirmation. |
+| 7 | During database file creation | An incomplete header is repaired during startup. |
+| 8 | During recovery | Recovery can safely run again. |
+| 9 | During incomplete-frame cleanup | Cleanup can be repeated safely. |
+| 10 | During temporary file creation | Original database remains safe. |
+| 11 | After temporary file Sync but before replacement | Original database remains available. |
+| 12 | During atomic file replacement | Either the old or new complete file should remain available. |
+| 13 | After file replacement | New compacted database is recovered normally. |
+| 14 | During temporary-file cleanup | Cleanup can be repeated during startup. |
+| 15 | During database Close | Previously acknowledged data remains safe. |
 
-A write is one `WriteAt` (`pwrite`; `WriteFile` at an offset on Windows) of the whole frame, then `Sync` (`fsync`; `FlushFileBuffers`), then the index update, then the return; `serve` prints `ACK` only after the return. So an ACK means `fsync` had returned for every byte of the frame. The frame's last 4 bytes, a CRC32C over its header and records, are the commit marker. Being a checksum, not a flag, it cannot validate unless every byte it covers reached the disk, in whatever order: no fsync is needed between records and marker, and a batch, being one frame, is all or nothing. Recovery stops at the first invalid frame and `ftruncate`s (`SetEndOfFile`) there before anything is appended, so an acknowledged frame can never sit behind garbage. One lock serializes writes, each synced before the next starts, so only the last frame can be torn. A failed `fsync` is never retried (the OS may have dropped the data, and a retry could report false success); the handle refuses further writes instead.
+## 2. Why Our Write Process Is Safe
 
-Compaction writes `<path>.compact.tmp`, `fsync`s it, verifies it with the recovery code, then replaces the data file with one call: `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` on Windows, `rename(2)` on Unix. The old file is never modified, so whichever name survives is a complete file. **Directory fsync:** on Unix we `fsync` the directory after the rename (`SyncDir`), because a rename changes the directory and the file's own `fsync` does not make it survive a power cut. Windows offers no directory fsync through `os`; `MOVEFILE_WRITE_THROUGH` returns only once the rename is on disk. A process kill needs neither (the OS keeps its state), which is all the problem requires. We do **not** fsync the directory after creating a new data file (see section 3).
+Every write follows this order:
 
-## 3. Known weaknesses
+1. Encode the operation into a frame.
+2. Write the frame to the database file.
+3. Sync the file to storage.
+4. Update the in-memory hash index.
+5. Return success.
+6. Send ACK to the client.
 
-- **Real kills never tore a write.** On Windows a kill lands between system calls, not inside a `WriteFile`; in over 1,000 torture kills recovery never removed a torn tail. Rows 2 and 3 are verified only by tests that write part of a frame and exit, and by a test that cuts a log at every byte.
-- **A torture seed does not reproduce the operation stream exactly.** The seed fixes the kill delays, but the key some deletes pick depends on Go's random map order, and later iterations depend on which in-flight operations survived. A failure is still reported in full with its `oracle.log`, but rerunning the seed may not hit it.
-- **Bit rot mid-file is treated as a torn tail** when under 64 MiB follows it: everything after it is silently cut. The CRC detects the damage; telling it from a torn tail needs a look-ahead for a valid frame with the next transaction id.
-- **Power loss is argued, not tested.** On Unix a new data file's directory entry is not fsynced, so a power cut just after the first acknowledged writes could lose the whole file. The Unix code (`flock`, `rename(2)`, `SyncDir`) compiles but has never run.
-- **Recovery time grows with file size**: about 0.3 s for 1M keys plus about 0.5 s per GB (measured to 1 GB). A few GB of live data would pass 2 s.
-- **One lock, one fsync per write:** `Get` waits during a write's fsync; compaction stops everything and needs room for a second copy (`MaxBytes` caps data file and temporary file separately). A batch must fit in 64 MiB, so 10,000 operations of 1 MB do not; a file over a lowered `MaxBytes` rejects even deletes.
+**Important: ACK is sent only after Sync succeeds.**
 
-## 4. What we tried that failed
+Each frame contains:
+- Header: Information about the frame.
+- Records: Actual database operations.
+- CRC32C: Checksum used to detect incomplete or corrupted frames.
 
-- **A separate commit-marker record** (records, fsync, marker, fsync): dropped at design time for the CRC trailer, which needs one fsync and has fewer crash states.
-- **Recovery speed:** the first version took 0.56-0.63 s for 1M keys. Disabling the garbage collector during replay was tried and dropped (gain within noise). One optimisation first *looked* slower because of machine drift; we moved to alternating A/B builds.
-- **Tests that could not fail**, found by breaking the code on purpose: the reader-isolation test read keys in the wrong order; the disk-full rollback test only looked at the file after recovery had cleaned it; the delete-reserve test always left slack; a compaction kill test assumed 3 frames where there were 2 (its "failpoint must fire" check caught it).
-- **Bugs:** `serve` rejected the first command piped from Windows PowerShell, which adds a byte-order mark (found by rehearsing the README); a bare unknown word in `serve` was taken for an id; two test packages raced for a shared test database; the stress test had a data race in its own failure flag. Caught in design: compacting inside the disk-full check after encoding would have given the frame a stale transaction id; the check now runs first.
-- **The torture tool found no violation in the engine.** Against deliberately broken builds (ACK before fsync, one frame per batch operation, recovery skipping frames) it failed each in the first iteration. Its disk-full mode at first never reached the limit and had to be retuned.
+During recovery, Astaroth validates each frame. If the final frame is incomplete or invalid, recovery removes it using file truncation.
 
-## 5. If we had 24 more hours
+A lock ensures that only one writer modifies the database at a time.
 
-1. **Reproducible torture failures and real torn writes:** derive every operation from (seed, iteration, writer, index) alone, and write large frames in several `WriteAt` calls so a SIGKILL can land between them.
-2. **Linux and power loss:** fsync the directory after creating a data file, run the torture suite on Linux, and cut a VM's power mid-run.
-3. **Bit rot and recovery time:** on an invalid frame, look ahead for the next transaction id and refuse instead of truncating if found; add a periodic index checkpoint so `open` replays only the log after it.
+### Unacknowledged Writes
+
+If a write does not receive an ACK, recovery may find the complete operation or no operation at all.
+
+A partially written operation must never be restored as valid data.
+
+### Batch Atomicity
+
+All operations in a batch are stored in one frame.
+
+During recovery, the entire batch is either restored or discarded. Partial batch execution is not allowed.
+
+## 3. Safe Compaction
+
+Compaction creates a new database file containing the latest data without directly modifying the original file.
+
+1. Create a temporary file.
+2. Write the latest database state.
+3. Sync the temporary file.
+4. Verify the temporary file.
+5. Atomically replace the original file.
+6. Sync the directory on Unix systems.
+
+If the process crashes before replacement, the original database remains available.
+
+If it crashes after replacement, the new database can be recovered.
+
+## 4. Known Limitations
+
+- More than 1,000 torture kills did not produce a real torn write.
+- Some torture test failures are difficult to reproduce exactly.
+- Mid-file corruption may cause valid data after the damaged frame to be removed.
+- Power failure scenarios have not been fully tested.
+- Unix implementation has not yet been tested in a real Unix environment.
+- Recovery time increases with database size.
+- A single writer lock and one Sync per write affect performance.
+- Compaction requires additional temporary disk space.
+- Large batches are limited to 64 MiB.
+
+## 5. What We Tried
+
+- Replaced a separate commit-marker record with a CRC32C checksum.
+- Tested recovery performance and rejected an ineffective garbage-collector optimization.
+- Fixed incorrect tests involving disk-full handling, reader isolation and compaction.
+- Fixed PowerShell input, command parsing and test race-condition bugs.
+- Tested deliberately broken implementations.
+
+Our torture tool detected deliberately introduced problems such as:
+- Sending ACK before Sync.
+- Writing each batch operation as a separate frame.
+- Skipping frames during recovery.
+
+**No integrity violation was found in the engine during our tested runs.**
+
+## 6. What We Would Improve With 24 More Hours
+
+1. **Better crash testing:** Make torture tests reproducible and improve torn-write testing.
+2. **Power failure testing:** Run the complete test suite on Linux and simulate sudden VM power failures.
+3. **Better corruption detection:** Distinguish incomplete final frames from corruption in the middle of the database.
+4. **Faster recovery:** Introduce periodic index checkpoints so recovery does not need to replay the entire database file.
+
+## 7. Final Summary
+
+Astaroth follows one critical rule:
+
+**Never acknowledge a write before its data has been synced to storage.**
+
+Our design combines:
+- Append-only log storage.
+- CRC32C validation.
+- Recovery through log replay.
+- An in-memory hash index.
+- Atomic file replacement during compaction.
+- Crash and torture testing.
+
+Our testing has not revealed an integrity violation, but power-loss handling, corruption detection and performance still need improvement.
+
+**We do not claim that Astaroth can never fail. We aim to ensure that crashes do not silently destroy previously acknowledged data.**
